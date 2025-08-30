@@ -1,4 +1,4 @@
-import UIKi
+import UIKit
 import AVFoundation
 import Vision
 import CoreHaptics
@@ -47,7 +47,7 @@ final class LiveCameraUIView: UIView {
     private var frameIndex = 0
     private let ocrEveryN = 2
     private let lockHits = 3
-    private let timeout: TimeInterval = 0.4          // fast cleanup
+    private let timeout: TimeInterval = 0.3          // Reduced from 0.4 for faster cleanup
     private let smoothing: CGFloat = 0.80
     private let buttonAreaHeight: CGFloat = 220
 
@@ -200,6 +200,20 @@ final class LiveCameraUIView: UIView {
         }
     }
 
+    private func removeTag(for number: String) {
+        // Remove the visual tag for a specific number
+        let layer = syncQ.sync { _tracks[number]?.tagLayer }
+        DispatchQueue.main.async {
+            layer?.removeFromSuperlayer()
+        }
+        syncQ.async(flags: .barrier) {
+            if var t = self._tracks[number] {
+                t.tagLayer = nil
+                self._tracks[number] = t
+            }
+        }
+    }
+
     private func clearAllTags() {
         let layers = syncQ.sync { _tracks.values.compactMap { $0.tagLayer } }
         layers.forEach { $0.removeFromSuperlayer() }
@@ -240,17 +254,30 @@ final class LiveCameraUIView: UIView {
 
     private func cleanupOldTracks(now: Date) {
         var toRemove: [String] = []
+        var layersToRemove: [CALayer] = []
+        
         syncQ.sync {
             for (num, t) in _tracks where now.timeIntervalSince(t.lastSeen) > timeout {
                 toRemove.append(num)
+                if let layer = t.tagLayer {
+                    layersToRemove.append(layer)
+                }
             }
         }
+        
         guard !toRemove.isEmpty else { return }
+        
+        // Remove visual tags from UI
         DispatchQueue.main.async {
-            let layers = self.syncQ.sync { toRemove.compactMap { self._tracks[$0]?.tagLayer } }
-            layers.forEach { $0.removeFromSuperlayer() }
+            layersToRemove.forEach { $0.removeFromSuperlayer() }
         }
-        syncQ.async(flags: .barrier) { toRemove.forEach { self._tracks.removeValue(forKey: $0) } }
+        
+        // Remove tracks from internal storage
+        syncQ.async(flags: .barrier) {
+            for num in toRemove {
+                self._tracks.removeValue(forKey: num)
+            }
+        }
     }
 }
 
@@ -269,31 +296,76 @@ extension LiveCameraUIView: AVCaptureVideoDataOutputSampleBufferDelegate {
         if !requests.isEmpty {
             do {
                 try VNSequenceRequestHandler().perform(requests, on: pixel, orientation: orientation)
+                
+                // Track which numbers were successfully tracked
+                var trackedNumbers = Set<String>()
+                
+                syncQ.sync {
+                    for (num, t) in self._tracks {
+                        if let obs = t.request.results?.first as? VNDetectedObjectObservation,
+                           obs.confidence > 0.1 { // Only consider confident observations
+                            trackedNumbers.insert(num)
+                        }
+                    }
+                }
+                
+                // Update tracks and remove failed ones
                 syncQ.async(flags: .barrier) {
                     var updates: [(String, VNDetectedObjectObservation)] = []
+                    var toRemove: [String] = []
+                    
                     for (num, var t) in self._tracks {
-                        if let obs = t.request.results?.first as? VNDetectedObjectObservation {
+                        if trackedNumbers.contains(num),
+                           let obs = t.request.results?.first as? VNDetectedObjectObservation,
+                           obs.confidence > 0.1 {
+                            // Successfully tracked
                             t.observation = obs
                             t.lastSeen = now
                             if t.hits < self.lockHits { t.hits += 1 }
                             if t.hits >= self.lockHits { t.locked = true }
                             self._tracks[num] = t
                             updates.append((num, obs))
+                        } else {
+                            // Tracking failed - mark for removal if old enough
+                            if now.timeIntervalSince(t.lastSeen) > 0.1 { // Quick removal for failed tracks
+                                toRemove.append(num)
+                            }
                         }
                     }
+                    
+                    // Remove failed tracks immediately
+                    if !toRemove.isEmpty {
+                        DispatchQueue.main.async {
+                            for num in toRemove {
+                                if let layer = self.syncQ.sync(execute: { self._tracks[num]?.tagLayer }) {
+                                    layer.removeFromSuperlayer()
+                                }
+                            }
+                        }
+                        for num in toRemove {
+                            self._tracks.removeValue(forKey: num)
+                        }
+                    }
+                    
+                    // Update positions for successful tracks
                     DispatchQueue.main.async {
                         for (num, obs) in updates {
                             let center = self.rectCenter(self.visionToPreviewRect(obs.boundingBox))
                             if center.y < self.bounds.height - self.buttonAreaHeight {
                                 self.ensureTag(for: num, at: center)
+                            } else {
+                                // Remove tag if it's in the button area
+                                self.removeTag(for: num)
                             }
                         }
                     }
                 }
-            } catch { /* OCR will re-seed if needed */ }
+            } catch {
+                // Tracking failed - will be cleaned up by timeout
+            }
         }
 
-        // 2) Cleanup stale tracks
+        // 2) Cleanup stale tracks (as backup for any that slip through)
         cleanupOldTracks(now: now)
 
         // 3) OCR every N frames (unconditional)
@@ -302,6 +374,9 @@ extension LiveCameraUIView: AVCaptureVideoDataOutputSampleBufferDelegate {
         let request = VNRecognizeTextRequest { [weak self] req, err in
             guard let self = self, err == nil,
                   let observations = req.results as? [VNRecognizedTextObservation] else { return }
+
+            // Track which numbers are currently visible
+            var currentlyVisible = Set<String>()
 
             for o in observations {
                 for cand in o.topCandidates(5) {
@@ -325,6 +400,8 @@ extension LiveCameraUIView: AVCaptureVideoDataOutputSampleBufferDelegate {
                             continue
                         }
 
+                        currentlyVisible.insert(num)
+
                         // Ask Vision for the bbox of just this substring
                         guard let subObs = try? cand.boundingBox(for: r) else { continue }
                         let rect = subObs.boundingBox
@@ -341,6 +418,27 @@ extension LiveCameraUIView: AVCaptureVideoDataOutputSampleBufferDelegate {
                             self.haptic()
                             self.onNumberCollected?(num)
                         }
+                    }
+                }
+            }
+            
+            // Remove tags for numbers no longer visible
+            self.syncQ.async(flags: .barrier) {
+                var toRemove: [(String, CALayer?)] = []
+                for (num, t) in self._tracks {
+                    if !currentlyVisible.contains(num) && now.timeIntervalSince(t.lastSeen) > 0.15 {
+                        toRemove.append((num, t.tagLayer))
+                    }
+                }
+                
+                if !toRemove.isEmpty {
+                    DispatchQueue.main.async {
+                        for (_, layer) in toRemove {
+                            layer?.removeFromSuperlayer()
+                        }
+                    }
+                    for (num, _) in toRemove {
+                        self._tracks.removeValue(forKey: num)
                     }
                 }
             }
