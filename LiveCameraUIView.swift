@@ -12,16 +12,17 @@ final class LiveCameraUIView: UIView {
     private let queue = DispatchQueue(label: "camera.video.queue", qos: .userInitiated)
     private var preview: AVCaptureVideoPreviewLayer!
 
-    // MARK: Track (one per number)
+    // MARK: Track (one live track per number)
     private struct Track {
         let number: String
-        var observation: VNDetectedObjectObservation
+        var observation: VNDetectedObjectObservation          // last raw obs (normalized rect)
         var request: VNTrackObjectRequest
         weak var tagLayer: CALayer?
         var lastSeen: Date
         var hits: Int
-        var misses: Int          // NEW: consecutive bad/empty frames
+        var misses: Int
         var locked: Bool
+        var filteredCenter: CGPoint?                          // NEW: normalized center (Vision space)
     }
 
     private let syncQ = DispatchQueue(label: "tracks.sync", attributes: .concurrent)
@@ -48,10 +49,10 @@ final class LiveCameraUIView: UIView {
     private var frameIndex = 0
     private let ocrEveryN = 2
     private let lockHits = 3
-    private let timeout: TimeInterval = 0.35        // expire quickly when unseen
-    private let minTrackConfidence: Float = 0.55    // NEW: only “good” tracker updates count
-    private let maxMissFrames = 6                   // NEW: consecutive misses before removal
-    private let smoothing: CGFloat = 0.80
+    private let timeout: TimeInterval = 0.35
+    private let maxMissFrames = 6
+    private let minTrackConfidence: Float = 0.70             // stricter to avoid noisy updates
+    private let emaAlpha: CGFloat = 0.18                     // NEW: position low-pass in normalized space
     private let buttonAreaHeight: CGFloat = 220
 
     // OCR tuning
@@ -66,6 +67,10 @@ final class LiveCameraUIView: UIView {
 
     // Tag style (small red pill, modern sharp font)
     private let tagFontSize: CGFloat = 17
+
+    // Reseed gating
+    private let reseedDistThresh: CGFloat = 0.05   // normalized center distance
+    private let reseedIoUThresh: CGFloat  = 0.20   // overlap gate
 
     // MARK: Init
     override init(frame: CGRect) {
@@ -145,10 +150,30 @@ final class LiveCameraUIView: UIView {
         r.origin.y = 1 - r.origin.y - r.height // Vision BL → preview TL
         return preview.layerRectConverted(fromMetadataOutputRect: r)
     }
+    private func visionCenterToPreviewPoint(_ c: CGPoint) -> CGPoint {
+        // Convert a tiny rect around normalized center to preview, take its center
+        let eps: CGFloat = 0.0001
+        let tiny = CGRect(x: c.x - eps, y: c.y - eps, width: eps * 2, height: eps * 2)
+        let pr = visionToPreviewRect(tiny)
+        return CGPoint(x: pr.midX, y: pr.midY)
+    }
     private func rectCenter(_ r: CGRect) -> CGPoint { CGPoint(x: r.midX, y: r.midY) }
     private func pixelAlign(_ p: CGPoint) -> CGPoint { CGPoint(x: round(p.x), y: round(p.y)) }
 
-    // MARK: Tag drawing
+    private func iou(_ a: CGRect, _ b: CGRect) -> CGFloat {
+        let inter = a.intersection(b)
+        if inter.isNull { return 0 }
+        let i = inter.width * inter.height
+        let u = a.width * a.height + b.width * b.height - i
+        return u > 0 ? i / u : 0
+    }
+    private func centerDist(_ a: CGRect, _ b: CGRect) -> CGFloat {
+        let ca = rectCenter(a), cb = rectCenter(b)
+        let dx = ca.x - cb.x, dy = ca.y - cb.y
+        return sqrt(dx*dx + dy*dy)
+    }
+
+    // MARK: Tag drawing (no extra smoothing here; we smooth earlier in normalized space)
     private func tagSize(for number: String) -> CGSize {
         let charW: CGFloat = 10.5
         let padding: CGFloat = 16
@@ -159,11 +184,8 @@ final class LiveCameraUIView: UIView {
         let existing = syncQ.sync { _tracks[number]?.tagLayer }
 
         if let layer = existing {
-            let cur = layer.position, s = smoothing
-            let smoothed = CGPoint(x: cur.x * s + center.x * (1 - s),
-                                   y: cur.y * s + center.y * (1 - s))
             CATransaction.begin(); CATransaction.setDisableActions(true)
-            layer.position = pixelAlign(smoothed)
+            layer.position = pixelAlign(center)
             CATransaction.commit()
             return
         }
@@ -213,22 +235,47 @@ final class LiveCameraUIView: UIView {
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
     }
 
-    // MARK: Track upsert (per number)
-    private func upsertTrack(number: String, normRect: CGRect) {
+    // MARK: Tracks
+    private func seedOrUpdateFromOCR(number: String, normRect: CGRect) {
         let det = VNDetectedObjectObservation(boundingBox: normRect)
 
         syncQ.async(flags: .barrier) {
             if var t = self._tracks[number] {
+                // If track is locked and not missing, only accept OCR reseed when close
+                if t.locked && t.misses < 2 {
+                    let iouVal = self.iou(t.observation.boundingBox, normRect)
+                    let dist   = self.centerDist(t.observation.boundingBox, normRect)
+                    if iouVal < self.reseedIoUThresh && dist > self.reseedDistThresh {
+                        // Ignore far reseed to avoid snap/jump
+                        return
+                    }
+                }
                 t.observation = det
                 t.request.inputObservation = det
                 t.lastSeen = Date()
-                t.misses = 0                       // RESET on OCR hit
+                t.misses = 0
+                // Update filtered center in normalized space
+                let m = self.rectCenter(normRect)
+                if let f = t.filteredCenter {
+                    t.filteredCenter = CGPoint(x: f.x + (m.x - f.x) * self.emaAlpha,
+                                               y: f.y + (m.y - f.y) * self.emaAlpha)
+                } else {
+                    t.filteredCenter = m
+                }
                 self._tracks[number] = t
             } else {
                 let req = VNTrackObjectRequest(detectedObjectObservation: det)
                 req.trackingLevel = .accurate
-                let track = Track(number: number, observation: det, request: req,
-                                  tagLayer: nil, lastSeen: Date(), hits: 1, misses: 0, locked: false)
+                let m = self.rectCenter(normRect)
+                let track = Track(number: number,
+                                  observation: det,
+                                  request: req,
+                                  tagLayer: nil,
+                                  lastSeen: Date(),
+                                  hits: 1,
+                                  misses: 0,
+                                  locked: false,
+                                  filteredCenter: m)          // initialize filter
                 self._tracks[number] = track
             }
         }
@@ -260,7 +307,7 @@ extension LiveCameraUIView: AVCaptureVideoDataOutputSampleBufferDelegate {
         let orientation = visionOrientation(for: c)
         let now = Date()
 
-        // 1) Run trackers every frame (confidence-gated)
+        // 1) Run trackers every frame (confidence-gated) + update filtered center
         let requests: [String: VNTrackObjectRequest] = syncQ.sync {
             Dictionary(uniqueKeysWithValues: _tracks.map { ($0.key, $0.value.request) })
         }
@@ -269,29 +316,44 @@ extension LiveCameraUIView: AVCaptureVideoDataOutputSampleBufferDelegate {
                 try VNSequenceRequestHandler().perform(Array(requests.values), on: pixel, orientation: orientation)
 
                 syncQ.async(flags: .barrier) {
-                    var updates: [(String, VNDetectedObjectObservation)] = []
+                    var toDraw: [(String, CGPoint)] = [] // number + filtered preview point
+
                     for (num, var t) in self._tracks {
                         if let obs = t.request.results?.first as? VNDetectedObjectObservation,
                            obs.confidence >= self.minTrackConfidence {
-                            // Good tracker frame
+
                             t.observation = obs
                             t.lastSeen = now
                             t.misses = 0
                             if t.hits < self.lockHits { t.hits += 1 }
                             if t.hits >= self.lockHits { t.locked = true }
+
+                            // EMA on normalized center
+                            let m = self.rectCenter(obs.boundingBox)
+                            if let f = t.filteredCenter {
+                                t.filteredCenter = CGPoint(x: f.x + (m.x - f.x) * self.emaAlpha,
+                                                           y: f.y + (m.y - f.y) * self.emaAlpha)
+                            } else {
+                                t.filteredCenter = m
+                            }
+
                             self._tracks[num] = t
-                            updates.append((num, obs))
+
+                            if let f = t.filteredCenter {
+                                toDraw.append((num, f))
+                            }
                         } else {
-                            // Bad/empty tracker result
+                            // bad/empty result — count a miss
                             t.misses += 1
                             self._tracks[num] = t
                         }
                     }
+
                     DispatchQueue.main.async {
-                        for (num, obs) in updates {
-                            let center = self.rectCenter(self.visionToPreviewRect(obs.boundingBox))
-                            if center.y < self.bounds.height - self.buttonAreaHeight {
-                                self.ensureTag(for: num, at: center)
+                        for (num, normCenter) in toDraw {
+                            let p = self.visionCenterToPreviewPoint(normCenter)
+                            if p.y < self.bounds.height - self.buttonAreaHeight {
+                                self.ensureTag(for: num, at: p)
                             }
                         }
                     }
@@ -299,7 +361,7 @@ extension LiveCameraUIView: AVCaptureVideoDataOutputSampleBufferDelegate {
             } catch { /* ignore; OCR will re-seed */ }
         }
 
-        // 2) Cleanup stale tracks (miss- or time-based)
+        // 2) Cleanup stale tracks
         cleanupOldTracks(now: now)
 
         // 3) OCR every N frames
@@ -321,10 +383,7 @@ extension LiveCameraUIView: AVCaptureVideoDataOutputSampleBufferDelegate {
                         guard let r = Range(m.range, in: original) else { continue }
                         let num = String(original[r])
 
-                        // Respect client list strictly if provided
                         if !self.numbersToMatch.isEmpty && !self.numbersToMatch.contains(num) { continue }
-
-                        // Optional: skip 4-digit years when no list provided
                         if self.numbersToMatch.isEmpty, num.count == 4, let v = Int(num), (1900...2099).contains(v) {
                             continue
                         }
@@ -332,11 +391,16 @@ extension LiveCameraUIView: AVCaptureVideoDataOutputSampleBufferDelegate {
                         guard let subObs = try? cand.boundingBox(for: r) else { continue }
                         let rect = subObs.boundingBox
 
-                        self.upsertTrack(number: num, normRect: rect)
+                        self.seedOrUpdateFromOCR(number: num, normRect: rect)
 
-                        let center = self.rectCenter(self.visionToPreviewRect(rect))
-                        if center.y < self.bounds.height - self.buttonAreaHeight {
-                            DispatchQueue.main.async { self.ensureTag(for: num, at: center) }
+                        // draw from filtered center (will be set/updated in seed)
+                        self.syncQ.async {
+                            if let f = self._tracks[num]?.filteredCenter {
+                                let p = self.visionCenterToPreviewPoint(f)
+                                if p.y < self.bounds.height - self.buttonAreaHeight {
+                                    DispatchQueue.main.async { self.ensureTag(for: num, at: p) }
+                                }
+                            }
                         }
 
                         if !self.collectedNumbers.contains(num) {
