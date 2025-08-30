@@ -2,6 +2,7 @@ import UIKit
 import AVFoundation
 import Vision
 import CoreHaptics
+import CoreVideo
 
 final class LiveCameraUIView: UIView {
 
@@ -9,36 +10,25 @@ final class LiveCameraUIView: UIView {
     private let session = AVCaptureSession()
     private let videoOut = AVCaptureVideoDataOutput()
     private let queue = DispatchQueue(label: "camera.video.queue", qos: .userInitiated)
-
-    // Visible container we rotate back to user-friendly orientation
-    private let canvasLayer = CALayer()                 // <- NEW: parent for preview + tags
     private var preview: AVCaptureVideoPreviewLayer!
 
-    // How much to rotate the visible canvas to look upright to the user.
-    // -.pi/2 = rotate RIGHT 90° (clockwise). If you want the other way, use +.pi/2.
-    private let rotationAngle: CGFloat = -.pi / 2
-
-    // MARK: Track model
+    // MARK: Track (one per number)
     private struct Track {
         let number: String
-        var observation: VNDetectedObjectObservation
-        var request: VNTrackObjectRequest
-        weak var tagLayer: CALayer?
+        var bbox: CGRect           // Vision-normalized rect
+        var tagLayer: CALayer?
         var lastSeen: Date
-        var hits: Int
-        var locked: Bool
     }
 
-    // Multiple tracks (one per value)
     private let syncQ = DispatchQueue(label: "tracks.sync", attributes: .concurrent)
-    private var _tracks: [String: Track] = [:]
+    private var _tracks: [String: Track] = [:]               // keyed by number
     private var tracks: [String: Track] {
         get { syncQ.sync { _tracks } }
         set { syncQ.async(flags: .barrier) { self._tracks = newValue } }
     }
 
     // MARK: Public API
-    var numbersToMatch: Set<String> = []          // empty = any 4-digit
+    var numbersToMatch: Set<String> = []     // empty = accept any 4–6 digit
     var collectedNumbers = Set<String>()
     var onNumberCollected: ((String) -> Void)?
     var onDebugUpdate: ((String) -> Void)?
@@ -52,40 +42,46 @@ final class LiveCameraUIView: UIView {
 
     // MARK: Tuning
     private var frameIndex = 0
-    private let ocrEveryN = 2
-    private let lockHits = 2
-    private let timeout: TimeInterval = 1.0
-    private let smoothing: CGFloat = 0.80
+    private let ocrEveryN = 3
+    private let tagTimeout: TimeInterval = 0.28
+    private let smoothing: CGFloat = 0.9
     private let buttonAreaHeight: CGFloat = 220
+
+    // OCR tuning
+    private let minTextHeight: Float = 0.02
+
+    // What counts as an ID
+    private let minDigits = 4
+    private let maxDigits = 6
+    private lazy var idRegex: NSRegularExpression? = try? NSRegularExpression(pattern: "\\b\\d{\(minDigits),\(maxDigits)}\\b")
+
+    // Tag style
+    private let tagFontSize: CGFloat = 17
 
     // MARK: Init
     override init(frame: CGRect) {
         super.init(frame: frame)
-        setupCamera()
-        prepareHaptics()
+        setupCamera(); prepareHaptics()
     }
     required init?(coder: NSCoder) {
         super.init(coder: coder)
-        setupCamera()
-        prepareHaptics()
+        setupCamera(); prepareHaptics()
     }
     deinit { session.stopRunning() }
 
-    // MARK: Camera setup (LANDSCAPE capture for Vision)
+    // MARK: Camera setup
     private func setupCamera() {
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               let input  = try? AVCaptureDeviceInput(device: device) else { return }
 
-        do {
-            try device.lockForConfiguration()
-            if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
-            if device.isSmoothAutoFocusSupported { device.isSmoothAutoFocusEnabled = true }
-            if device.isAutoFocusRangeRestrictionSupported { device.autoFocusRangeRestriction = .near }
-            if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
-            if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
-            if device.isLowLightBoostSupported { device.automaticallyEnablesLowLightBoostWhenAvailable = true }
-            device.unlockForConfiguration()
-        } catch { print("Device config error: \(error)") }
+        try? device.lockForConfiguration()
+        if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
+        if device.isSmoothAutoFocusSupported { device.isSmoothAutoFocusEnabled = true }
+        if device.isAutoFocusRangeRestrictionSupported { device.autoFocusRangeRestriction = .near }
+        if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+        if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
+        if device.isLowLightBoostSupported { device.automaticallyEnablesLowLightBoostWhenAvailable = true }
+        device.unlockForConfiguration()
 
         session.beginConfiguration()
         session.sessionPreset = session.canSetSessionPreset(.hd1920x1080) ? .hd1920x1080 : .high
@@ -93,112 +89,99 @@ final class LiveCameraUIView: UIView {
 
         videoOut.setSampleBufferDelegate(self, queue: queue)
         videoOut.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
-        videoOut.alwaysDiscardsLateVideoFrames = false
+        videoOut.alwaysDiscardsLateVideoFrames = true
         if session.canAddOutput(videoOut) { session.addOutput(videoOut) }
 
-        // IMPORTANT: keep the capture stream in landscapeRight (works best with your racks)
         if let c = videoOut.connection(with: .video) {
-            if c.isVideoOrientationSupported { c.videoOrientation = .landscapeRight }
-            if c.isVideoStabilizationSupported { c.preferredVideoStabilizationMode = .off }
-            if c.isVideoMirroringSupported { c.isVideoMirrored = false }
+            if c.isVideoRotationAngleSupported(0.0) { c.videoRotationAngle = 0.0 } // keep buffers upright for Vision
         }
 
         session.commitConfiguration()
 
-        // Canvas (rotated container) → Preview inside
-        canvasLayer.frame = bounds
-        layer.addSublayer(canvasLayer)
-
         preview = AVCaptureVideoPreviewLayer(session: session)
         preview.videoGravity = .resizeAspectFill
-        preview.frame = canvasLayer.bounds
-        canvasLayer.addSublayer(preview)
-
-        // Rotate the WHOLE canvas (preview + future tags) back to a user-natural view
-        canvasLayer.setAffineTransform(CGAffineTransform(rotationAngle: rotationAngle))
+        layer.addSublayer(preview)
+        if let c = preview.connection, c.isVideoRotationAngleSupported(90.0) { c.videoRotationAngle = 90.0 }
 
         DispatchQueue.global(qos: .userInteractive).async { self.session.startRunning() }
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        canvasLayer.frame = bounds
-        preview?.frame = canvasLayer.bounds
-        // Keep rotation applied after layout changes
-        canvasLayer.setAffineTransform(CGAffineTransform(rotationAngle: rotationAngle))
+        preview?.frame = bounds
+        if let c = preview?.connection, c.isVideoRotationAngleSupported(90.0) { c.videoRotationAngle = 90.0 }
     }
 
-    // MARK: Orientation mapping for Vision
-    private func visionOrientation(for connection: AVCaptureConnection) -> CGImagePropertyOrientation {
-        // Our capture connection is landscapeRight → Vision orientation .up
-        switch connection.videoOrientation {
-        case .landscapeRight: return .up
-        case .landscapeLeft:  return .down
-        case .portrait:       return .right
-        case .portraitUpsideDown: return .left
-        @unknown default:     return .up
-        }
-    }
-
-    // MARK: Geometry helpers
-    /// Vision (BL, normalized) → preview layer rect (TL, pixel space), computed BEFORE we rotate the canvas.
+    // MARK: Helpers
     private func visionToPreviewRect(_ v: CGRect) -> CGRect {
         var r = v
-        r.origin.y = 1 - r.origin.y - r.height // BL → TL
+        r.origin.y = 1 - r.origin.y - r.height // Vision BL → preview TL
         return preview.layerRectConverted(fromMetadataOutputRect: r)
     }
     private func rectCenter(_ r: CGRect) -> CGPoint { CGPoint(x: r.midX, y: r.midY) }
+    private func pixelAlign(_ p: CGPoint) -> CGPoint { CGPoint(x: round(p.x), y: round(p.y)) }
 
-    // MARK: Tag drawing (value only)
+    // MARK: Tag mgmt
+    private func tagSize(for number: String) -> CGSize {
+        let charW: CGFloat = 11.5, padding: CGFloat = 24
+        return CGSize(width: max(52, CGFloat(number.count) * charW + padding), height: 26)
+    }
+
     private func ensureTag(for number: String, at center: CGPoint) {
-        let existingLayer = syncQ.sync { _tracks[number]?.tagLayer }
+        let existing = syncQ.sync { _tracks[number]?.tagLayer }
 
-        if let layer = existingLayer {
+        if let layer = existing {
             let cur = layer.position, s = smoothing
             let smoothed = CGPoint(x: cur.x * s + center.x * (1 - s),
                                    y: cur.y * s + center.y * (1 - s))
             CATransaction.begin(); CATransaction.setDisableActions(true)
-            layer.position = smoothed
-            if let text = layer.sublayers?.first(where: { $0 is CATextLayer }) as? CATextLayer {
-                text.string = number
-            }
+            layer.position = pixelAlign(smoothed)
             CATransaction.commit()
             return
         }
 
+        // Create once
         let container = CALayer()
-        container.bounds = CGRect(x: 0, y: 0, width: 1, height: 1)
-        container.position = center
+        container.bounds = CGRect(origin: .zero, size: .init(width: 1, height: 1))
+        container.position = pixelAlign(center)
         container.zPosition = 999
 
         let label = CATextLayer()
         label.string = number
-        label.fontSize = 24
-        label.font = UIFont.monospacedSystemFont(ofSize: 24, weight: .bold)
+        label.font = UIFont.systemFont(ofSize: tagFontSize, weight: .semibold)
+        label.fontSize = tagFontSize
         label.alignmentMode = .center
-        label.foregroundColor = UIColor.red.cgColor
-        label.backgroundColor = UIColor.black.withAlphaComponent(0.55).cgColor
-        label.cornerRadius = 10
+        label.foregroundColor = UIColor.white.cgColor
+        label.backgroundColor = UIColor.systemRed.withAlphaComponent(0.85).cgColor
+        label.cornerRadius = 4
         label.contentsScale = UIScreen.main.scale
-        label.bounds = CGRect(x: 0, y: 0, width: 86, height: 40)
+        label.isWrapped = false
+        label.truncationMode = .end
+        label.bounds = CGRect(origin: .zero, size: tagSize(for: number))
         label.position = .zero
-        label.shadowColor = UIColor.black.cgColor
-        label.shadowOpacity = 0.7
-        label.shadowRadius = 2
-        label.shadowOffset = CGSize(width: 0, height: 1)
 
         container.addSublayer(label)
-        // Add tag to the ROTATED canvas so it turns with the preview
-        canvasLayer.addSublayer(container)
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        preview.addSublayer(container)
+        CATransaction.commit()
 
-        syncQ.async(flags: .barrier) {
+        // 🔒 Synchronous write avoids the race that caused duplicates
+        syncQ.sync(flags: .barrier) {
             if var t = self._tracks[number] { t.tagLayer = container; self._tracks[number] = t }
+        }
+    }
+
+    private func removeTag(for number: String) {
+        let layer = syncQ.sync { _tracks[number]?.tagLayer }
+        DispatchQueue.main.async { layer?.removeFromSuperlayer() }
+        syncQ.async(flags: .barrier) {
+            if var t = self._tracks[number] { t.tagLayer = nil; self._tracks[number] = t }
         }
     }
 
     private func clearAllTags() {
         let layers = syncQ.sync { _tracks.values.compactMap { $0.tagLayer } }
-        layers.forEach { $0.removeFromSuperlayer() }
+        DispatchQueue.main.async { layers.forEach { $0.removeFromSuperlayer() } }
         tracks = [:]
     }
 
@@ -211,56 +194,20 @@ final class LiveCameraUIView: UIView {
     private func haptic() {
         guard Date().timeIntervalSince(lastHaptic) > hapticDebounce else { return }
         lastHaptic = Date()
-        if let e = engine {
-            do {
-                let e1 = CHHapticEvent(eventType: .hapticTransient, parameters: [], relativeTime: 0)
-                let e2 = CHHapticEvent(eventType: .hapticTransient, parameters: [], relativeTime: 0.1)
-                let pattern = try CHHapticPattern(events: [e1, e2], parameters: [])
-                let player = try e.makePlayer(with: pattern); try? player.start(atTime: 0)
-                return
-            } catch {}
-        }
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
     }
 
-    // MARK: Track helpers
-    private func updateOrCreateTrack(number: String, normRect: CGRect) {
-        let det = VNDetectedObjectObservation(boundingBox: normRect)
-        syncQ.async(flags: .barrier) {
-            if var t = self._tracks[number] {
-                t.observation = det
-                t.request.inputObservation = det
-                t.lastSeen = Date()
-                self._tracks[number] = t
-            } else {
-                let req = VNTrackObjectRequest(detectedObjectObservation: det)
-                req.trackingLevel = .accurate
-                self._tracks[number] = Track(number: number,
-                                             observation: det,
-                                             request: req,
-                                             tagLayer: nil,
-                                             lastSeen: Date(),
-                                             hits: 1,
-                                             locked: false)
-            }
-        }
-    }
-
-    private func cleanupOldTracks(now: Date) {
-        var toRemove: [String] = []
+    // MARK: Cleanup
+    private func cleanupOldTracks() {
+        let now = Date()
+        var stale: [String] = []
         syncQ.sync {
-            for (num, t) in _tracks where now.timeIntervalSince(t.lastSeen) > timeout {
-                toRemove.append(num)
+            for (num, t) in _tracks where now.timeIntervalSince(t.lastSeen) > tagTimeout {
+                stale.append(num)
             }
         }
-        guard !toRemove.isEmpty else { return }
-        DispatchQueue.main.async {
-            let layers = self.syncQ.sync { toRemove.compactMap { self._tracks[$0]?.tagLayer } }
-            layers.forEach { $0.removeFromSuperlayer() }
-        }
-        syncQ.async(flags: .barrier) {
-            toRemove.forEach { self._tracks.removeValue(forKey: $0) }
-        }
+        for num in stale { removeTag(for: num) }
+        syncQ.async(flags: .barrier) { stale.forEach { self._tracks.removeValue(forKey: $0) } }
     }
 }
 
@@ -269,72 +216,68 @@ extension LiveCameraUIView: AVCaptureVideoDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sb: CMSampleBuffer, from c: AVCaptureConnection) {
         guard isScanning, let pixel = CMSampleBufferGetImageBuffer(sb) else { return }
         frameIndex += 1
-        if c.isVideoOrientationSupported { c.videoOrientation = .landscapeRight } // keep capture in landscape
 
-        let orientation = visionOrientation(for: c)
-        let now = Date()
+        cleanupOldTracks()
+        guard frameIndex % ocrEveryN == 0 else { return }
 
-        // 1) Run all trackers
-        let requests: [VNTrackObjectRequest] = syncQ.sync { Array(self._tracks.values.map { $0.request }) }
-        if !requests.isEmpty {
-            do {
-                try VNSequenceRequestHandler().perform(requests, on: pixel, orientation: orientation)
-                syncQ.async(flags: .barrier) {
-                    var updated: [(String, VNDetectedObjectObservation)] = []
-                    for (num, var t) in self._tracks {
-                        if let obs = t.request.results?.first as? VNDetectedObjectObservation {
-                            t.observation = obs
-                            t.lastSeen = now
-                            if t.hits < self.lockHits { t.hits += 1 }
-                            if t.hits >= self.lockHits { t.locked = true }
-                            self._tracks[num] = t
-                            updated.append((num, obs))
-                        }
+        let request = VNRecognizeTextRequest { [weak self] req, err in
+            guard let self = self, err == nil,
+                  let observations = req.results as? [VNRecognizedTextObservation] else { return }
+
+            let now = Date()
+
+            // Aggregate: pick ONE best rect per number this frame
+            var bestForNumber: [String: CGRect] = [:]
+            var bestScore:    [String: CGFloat] = [:]
+
+            for obs in observations {
+                guard let text = obs.topCandidates(1).first?.string else { continue }
+                guard let regex = self.idRegex else { continue }
+
+                let ns = NSString(string: text)
+                for m in regex.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+                    guard let r = Range(m.range, in: text) else { continue }
+                    let number = String(text[r])
+
+                    if !self.numbersToMatch.isEmpty && !self.numbersToMatch.contains(number) { continue }
+                    if self.numbersToMatch.isEmpty, number.count == 4, let v = Int(number), (1900...2099).contains(v) { continue }
+
+                    guard let bb = try? obs.topCandidates(1).first!.boundingBox(for: r) else { continue }
+                    let rect = bb.boundingBox
+
+                    // Score = bigger box + preference for proximity to previous center (if any)
+                    let area = rect.width * rect.height
+                    let prevCenter = self.syncQ.sync { self._tracks[number].map { self.rectCenter(self.visionToPreviewRect($0.bbox)) } }
+                    var score = CGFloat(area)
+                    if let pc = prevCenter {
+                        let nc = self.rectCenter(self.visionToPreviewRect(rect))
+                        let d = hypot(pc.x - nc.x, pc.y - nc.y) + 1
+                        score += 0.25 / d // favor close to previous
                     }
-                    DispatchQueue.main.async {
-                        for (num, obs) in updated {
-                            let center = self.rectCenter(self.visionToPreviewRect(obs.boundingBox))
-                            if center.y < self.bounds.height - self.buttonAreaHeight {
-                                self.ensureTag(for: num, at: center)
-                            }
-                        }
-                    }
-                }
-            } catch { /* OCR will re-acquire */ }
-        }
 
-        // 2) Cleanup stale tracks
-        cleanupOldTracks(now: now)
-
-        // 3) OCR periodically or while we need more values
-        let needMore = numbersToMatch.isEmpty || !numbersToMatch.isSubset(of: Set(tracks.keys))
-        if needMore || frameIndex % ocrEveryN == 0 {
-            let request = VNRecognizeTextRequest { [weak self] req, err in
-                guard let self = self, err == nil,
-                      let observations = req.results as? [VNRecognizedTextObservation] else { return }
-
-                var found: [(String, CGRect)] = []
-
-                for o in observations {
-                    for cand in o.topCandidates(5) {
-                        let original = cand.string
-                        // Extract numeric groups from ORIGINAL text to preserve indices
-                        let groups = original.split(whereSeparator: { !$0.isNumber }).map(String.init)
-                        for g in groups where g.count == 4 {
-                            if !self.numbersToMatch.isEmpty && !self.numbersToMatch.contains(g) { continue }
-                            if let r = original.range(of: g),
-                               let rectObs = try? cand.boundingBox(for: r) {
-                                found.append((g, rectObs.boundingBox))
-                            }
-                        }
+                    if score > (bestScore[number] ?? -1) {
+                        bestScore[number] = score
+                        bestForNumber[number] = rect
                     }
                 }
+            }
 
-                for (num, normRect) in found {
-                    self.updateOrCreateTrack(number: num, normRect: normRect)
-                    let center = self.rectCenter(self.visionToPreviewRect(normRect))
+            // Update tracks once per number; draw exactly one tag
+            self.syncQ.async(flags: .barrier) {
+                for (num, rect) in bestForNumber {
+                    if var t = self._tracks[num] {
+                        t.bbox = rect; t.lastSeen = now; self._tracks[num] = t
+                    } else {
+                        self._tracks[num] = Track(number: num, bbox: rect, tagLayer: nil, lastSeen: now)
+                    }
+                }
+            }
+
+            DispatchQueue.main.async {
+                for (num, rect) in bestForNumber {
+                    let center = self.rectCenter(self.visionToPreviewRect(rect))
                     if center.y < self.bounds.height - self.buttonAreaHeight {
-                        DispatchQueue.main.async { self.ensureTag(for: num, at: center) }
+                        self.ensureTag(for: num, at: center)
                     }
                     if !self.collectedNumbers.contains(num) {
                         self.collectedNumbers.insert(num)
@@ -343,14 +286,15 @@ extension LiveCameraUIView: AVCaptureVideoDataOutputSampleBufferDelegate {
                     }
                 }
             }
-
-            request.recognitionLevel = .accurate
-            request.usesLanguageCorrection = false
-            request.recognitionLanguages = ["en-US"]
-            request.minimumTextHeight = 0.02
-
-            let handler = VNImageRequestHandler(cvPixelBuffer: pixel, orientation: orientation, options: [:])
-            do { try handler.perform([request]) } catch { onDebugUpdate?("OCR failed: \(error.localizedDescription)") }
         }
+
+        request.recognitionLevel = .accurate
+        request.usesLanguageCorrection = false
+        request.recognitionLanguages = ["en-US"]
+        request.minimumTextHeight = minTextHeight
+        if !numbersToMatch.isEmpty { request.customWords = Array(numbersToMatch) }
+
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixel, orientation: .up, options: [:])
+        try? handler.perform([request])
     }
 }
